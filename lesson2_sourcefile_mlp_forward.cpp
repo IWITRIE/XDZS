@@ -15,7 +15,16 @@
 #define H 20
 #define O 5
 
-// 主要修改函数
+// 新增：添加偏置的kernel
+__global__ void add_bias_kernel(double* output, const double* bias, int rows, int cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < rows * cols) {
+        int col = idx % cols;
+        output[idx] += bias[col];
+    }
+}
+
+// 修改：优化矩阵乘法kernel
 __global__ void matmul_kernel(const double* A, const double* B, double* C, int M, int N, int K) {
     const int TILE_SIZE = 16;
     __shared__ double As[TILE_SIZE][TILE_SIZE];
@@ -26,7 +35,6 @@ __global__ void matmul_kernel(const double* A, const double* B, double* C, int M
     double sum = 0.0;
 
     for (int t = 0; t < (N + TILE_SIZE - 1) / TILE_SIZE; ++t) {
-        // 加载数据到共享内存
         if (row < M && t * TILE_SIZE + threadIdx.x < N)
             As[threadIdx.y][threadIdx.x] = A[row * N + t * TILE_SIZE + threadIdx.x];
         else
@@ -39,7 +47,6 @@ __global__ void matmul_kernel(const double* A, const double* B, double* C, int M
         
         __syncthreads();
 
-        // 计算tile内的乘法累加
         for (int k = 0; k < TILE_SIZE; ++k)
             sum += As[threadIdx.y][k] * Bs[k][threadIdx.x];
             
@@ -79,7 +86,13 @@ int main() {
     double *d_X, *d_W1, *d_B1, *d_H, *d_W2, *d_B2, *d_Y;
     
 
-    // 内存分配
+    // 计时事件
+    hipEvent_t start, stop;
+    hipEventCreate(&start);
+    hipEventCreate(&stop);
+    float milliseconds = 0;
+
+    // 内存分配和数据传输
     hipMalloc(&d_X, BATCH * I * sizeof(double));
     hipMalloc(&d_W1, I * H * sizeof(double));
     hipMalloc(&d_B1, H * sizeof(double));
@@ -88,33 +101,51 @@ int main() {
     hipMalloc(&d_B2, O * sizeof(double));
     hipMalloc(&d_Y, BATCH * O * sizeof(double));
 
-    // 数据传输到设备
     hipMemcpy(d_X, h_X.data(), BATCH * I * sizeof(double), hipMemcpyHostToDevice);
     hipMemcpy(d_W1, h_W1.data(), I * H * sizeof(double), hipMemcpyHostToDevice);
     hipMemcpy(d_B1, h_B1.data(), H * sizeof(double), hipMemcpyHostToDevice);
     hipMemcpy(d_W2, h_W2.data(), H * O * sizeof(double), hipMemcpyHostToDevice);
     hipMemcpy(d_B2, h_B2.data(), O * sizeof(double), hipMemcpyHostToDevice);
 
-    // Hidden layer: H = X * W1
+    hipEventRecord(start);
+
+    // Hidden layer: H = X * W1 + B1
     dim3 blockDim(16, 16);
     dim3 gridDim1((H + blockDim.x - 1) / blockDim.x, 
-                 (BATCH + blockDim.y - 1) / blockDim.y);
+                  (BATCH + blockDim.y - 1) / blockDim.y);
     hipLaunchKernelGGL(matmul_kernel, gridDim1, blockDim, 0, 0,
                        d_X, d_W1, d_H, BATCH, I, H);
+    
+    // Add bias
+    dim3 gridDim_bias1((BATCH * H + 255) / 256);
+    hipLaunchKernelGGL(add_bias_kernel, gridDim_bias1, 256, 0, 0,
+                       d_H, d_B1, BATCH, H);
 
-    // Add bias and apply ReLU
-    dim3 gridDim2((BATCH * H + 255) / 256);
-    hipLaunchKernelGGL(relu_kernel, gridDim2, 256, 0, 0,
+    // Apply ReLU
+    hipLaunchKernelGGL(relu_kernel, gridDim_bias1, 256, 0, 0,
                        d_H, BATCH * H);
 
-    // Output layer: Y = H * W2
-    dim3 gridDim3((O + blockDim.x - 1) / blockDim.x,
-                 (BATCH + blockDim.y - 1) / blockDim.y);
-    hipLaunchKernelGGL(matmul_kernel, gridDim3, blockDim, 0, 0,
+    // Output layer: Y = H * W2 + B2
+    dim3 gridDim2((O + blockDim.x - 1) / blockDim.x,
+                  (BATCH + blockDim.y - 1) / blockDim.y);
+    hipLaunchKernelGGL(matmul_kernel, gridDim2, blockDim, 0, 0,
                        d_H, d_W2, d_Y, BATCH, H, O);
 
-    // 将结果复制回主机
+    // Add output bias
+    dim3 gridDim_bias2((BATCH * O + 255) / 256);
+    hipLaunchKernelGGL(add_bias_kernel, gridDim_bias2, 256, 0, 0,
+                       d_Y, d_B2, BATCH, O);
+
+    hipEventRecord(stop);
+    hipEventSynchronize(stop);
+    hipEventElapsedTime(&milliseconds, start, stop);
+
+    // 复制结果回主机
     hipMemcpy(h_Y.data(), d_Y, BATCH * O * sizeof(double), hipMemcpyDeviceToHost);
+
+    // 打印性能指标
+    std::cout << "Forward Pass Time: " << milliseconds << " ms" << std::endl;
+    std::cout << "Throughput: " << (BATCH / (milliseconds / 1000.0)) << " samples/s" << std::endl;
 
     // 打印部分结果用于验证
     for (int i = 0; i < 5; ++i) {
