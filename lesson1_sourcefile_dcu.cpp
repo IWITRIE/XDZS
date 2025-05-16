@@ -16,7 +16,15 @@
 
 // 主要修改函数
 __global__ void matmul_kernel(const double* A, const double* B, double* C, int n, int m, int p) {
-    return;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < n && col < p) {
+        double sum = 0.0;
+        for (int k = 0; k < m; ++k) {
+            sum += A[row * m + k] * B[k * p + col];
+        }
+        C[row * p + col] = sum;
+    }
 }
 
 void init_matrix(std::vector<double>& mat) {
@@ -56,13 +64,30 @@ int main() {
     // 主要修改部分
     // Allocate and copy to device, use matmul_kernel to compute in DCU
     double *d_A, *d_B, *d_C;
+    size_t size_A = N * M * sizeof(double);
+    size_t size_B = M * P * sizeof(double);
+    size_t size_C = N * P * sizeof(double);
+
+    hipMalloc(&d_A, size_A);
+    hipMalloc(&d_B, size_B);
+    hipMalloc(&d_C, size_C);
+
+    hipMemcpy(d_A, A.data(), size_A, hipMemcpyHostToDevice);
+    hipMemcpy(d_B, B.data(), size_B, hipMemcpyHostToDevice);
+
+    dim3 blockDim(16, 16);
+    dim3 gridDim((P + blockDim.x - 1) / blockDim.x, (N + blockDim.y - 1) / blockDim.y);
+
+    hipLaunchKernelGGL(matmul_kernel, gridDim, blockDim, 0, 0, d_A, d_B, d_C, N, M, P);
+
+    hipMemcpy(C.data(), d_C, size_C, hipMemcpyDeviceToHost);
 
     
-    // if (validate(C_ref, C)) {
-    //    std::cout << "[HIP] Valid: 1" << std::endl;
-    // } else {
-    //    std::cout << "[HIP] Valid: 0" << std::endl;
-    // }
+    if (validate(C_ref, C)) {
+       std::cout << "[HIP] Valid: 1" << std::endl;
+    } else {
+       std::cout << "[HIP] Valid: 0" << std::endl;
+    }
 
     hipFree(d_A);
     hipFree(d_B);
