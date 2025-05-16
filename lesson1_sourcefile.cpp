@@ -57,19 +57,115 @@ void matmul_baseline(const std::vector<double>& A,
 void matmul_openmp(const std::vector<double>& A,
                    const std::vector<double>& B,
                    std::vector<double>& C, int N, int M, int P) {
-        std::cout << "matmul_openmp methods..." << std::endl;
+    std::cout << "matmul_openmp methods..." << std::endl;
+    #pragma omp parallel for
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < P; ++j) {
+            double sum = 0.0;
+            for (int k = 0; k < M; ++k) {
+                sum += A[i * M + k] * B[k * P + j];
+            }
+            C[i * P + j] = sum;
+        }
+    }
 }
 
 // 方式2: 利用子块并行思想，进行缓存友好型的并行优化方法 （主要修改函数)
 void matmul_block_tiling(const std::vector<double>& A,
                          const std::vector<double>& B,
-                         std::vector<double>& C, int N, int M, int P, int block_size = 64) {
-        std::cout << "matmul_block_tiling methods..." << std::endl;
+                         std::vector<double>& C, int N, int M, int P, int block_size) {
+    std::cout << "matmul_block_tiling methods..." << std::endl;
+    // 块划分并OpenMP并行
+    #pragma omp parallel for collapse(2)
+    for (int ii = 0; ii < N; ii += block_size) {
+        for (int jj = 0; jj < P; jj += block_size) {
+            for (int kk = 0; kk < M; kk += block_size) {
+                int i_max = std::min(ii + block_size, N);
+                int j_max = std::min(jj + block_size, P);
+                int k_max = std::min(kk + block_size, M);
+                for (int i = ii; i < i_max; ++i) {
+                    for (int j = jj; j < j_max; ++j) {
+                        double sum = 0.0;
+                        for (int k = kk; k < k_max; ++k) {
+                            sum += A[i * M + k] * B[k * P + j];
+                        }
+                        // 累加到C[i*P+j]，因为kk循环是分块累加
+                        #pragma omp atomic
+                        C[i * P + j] += sum;
+                    }
+                }
+            }
+        }
+    }
 }
-
 // 方式3: 利用MPI消息传递，实现多进程并行优化 （主要修改函数）
 void matmul_mpi(int N, int M, int P) {
     std::cout << "matmul_mpi methods..." << std::endl;
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // 每个进程分配的行数
+    int rows_per_proc = N / size;
+    int remain = N % size;
+    int local_N = rows_per_proc + (rank < remain ? 1 : 0);
+    int start_row = rank * rows_per_proc + std::min(rank, remain);
+
+    // 分配本地矩阵
+    std::vector<double> local_A(local_N * M);
+    std::vector<double> B(M * P);
+    std::vector<double> local_C(local_N * P, 0);
+
+    // 只在0号进程生成A和B
+    std::vector<double> A;
+    if (rank == 0) {
+        A.resize(N * M);
+        init_matrix(A, N, M);
+        init_matrix(B, M, P);
+    }
+
+    // 广播B
+    MPI_Bcast(B.data(), M * P, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    // 计算每个进程的分布信息
+    std::vector<int> sendcounts(size), displs(size);
+    for (int i = 0; i < size; ++i) {
+        sendcounts[i] = (rows_per_proc + (i < remain ? 1 : 0)) * M;
+        displs[i] = i * rows_per_proc * M + std::min(i, remain) * M;
+    }
+
+    // 分发A
+    MPI_Scatterv(rank == 0 ? A.data() : nullptr, sendcounts.data(), displs.data(), MPI_DOUBLE,
+                 local_A.data(), local_N * M, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    // 本地计算
+    for (int i = 0; i < local_N; ++i) {
+        for (int j = 0; j < P; ++j) {
+            double sum = 0.0;
+            for (int k = 0; k < M; ++k) {
+                sum += local_A[i * M + k] * B[k * P + j];
+            }
+            local_C[i * P + j] = sum;
+        }
+    }
+
+    // 收集C
+    std::vector<int> recvcounts(size), recvdispls(size);
+    for (int i = 0; i < size; ++i) {
+        recvcounts[i] = (rows_per_proc + (i < remain ? 1 : 0)) * P;
+        recvdispls[i] = i * rows_per_proc * P + std::min(i, remain) * P;
+    }
+    std::vector<double> C;
+    if (rank == 0) C.resize(N * P);
+
+    MPI_Gatherv(local_C.data(), local_N * P, MPI_DOUBLE,
+                rank == 0 ? C.data() : nullptr, recvcounts.data(), recvdispls.data(), MPI_DOUBLE,
+                0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        std::cout << "[MPI] Done." << std::endl;
+        // 可加验证或性能统计
+    }
 }
 
 // 方式4: 其他方式 （主要修改函数）
