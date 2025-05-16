@@ -10,4 +10,4 @@ echo "==== Block Parallel ===="
 ./outputfile block
 
 echo "==== MPI (4 processes) ===="
-mpirun -np 4 ./outputfile mpi
+mpirun --allow-run-as-root -np 4 ./outputfile mpi

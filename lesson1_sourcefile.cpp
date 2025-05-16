@@ -168,11 +168,29 @@ void matmul_mpi(int N, int M, int P) {
     }
 }
 
-// 方式4: 其他方式 （主要修改函数）
+// OpenMP 并行+手动循环展开
 void matmul_other(const std::vector<double>& A,
                   const std::vector<double>& B,
                   std::vector<double>& C, int N, int M, int P) {
-    std::cout << "Other methods..." << std::endl;
+    std::cout << "Other methods (OpenMP + Unroll/Vectorize)..." << std::endl;
+    #pragma omp parallel for
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < P; ++j) {
+            double sum = 0.0;
+            int k = 0;
+            // 手动展开4倍循环，利于编译器自动SIMD优化
+            for (; k + 3 < M; k += 4) {
+                sum += A[i * M + k] * B[k * P + j];
+                sum += A[i * M + k + 1] * B[(k + 1) * P + j];
+                sum += A[i * M + k + 2] * B[(k + 2) * P + j];
+                sum += A[i * M + k + 3] * B[(k + 3) * P + j];
+            }
+            for (; k < M; ++k) {
+                sum += A[i * M + k] * B[k * P + j];
+            }
+            C[i * P + j] = sum;
+        }
+    }
 }
 
 int main(int argc, char** argv) {
