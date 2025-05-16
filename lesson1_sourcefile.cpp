@@ -181,7 +181,14 @@ int main(int argc, char** argv) {
 
     if (mode == "mpi") {
         MPI_Init(&argc, &argv);
+        int rank;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        double t0 = omp_get_wtime();
         matmul_mpi(N, M, P);
+        double t1 = omp_get_wtime();
+        if (rank == 0) {
+            std::cout << "[MPI] Time: " << (t1 - t0) << " s" << std::endl;
+        }
         MPI_Finalize();
         return 0;
     }
@@ -193,19 +200,33 @@ int main(int argc, char** argv) {
 
     init_matrix(A, N, M);
     init_matrix(B, M, P);
+
+    double t0 = omp_get_wtime();
     matmul_baseline(A, B, C_ref, N, M, P);
+    double t1 = omp_get_wtime();
 
     if (mode == "baseline") {
         std::cout << "[Baseline] Done.\n";
+        std::cout << "[Baseline] Time: " << (t1 - t0) << " s" << std::endl;
     } else if (mode == "openmp") {
+        t0 = omp_get_wtime();
         matmul_openmp(A, B, C, N, M, P);
+        t1 = omp_get_wtime();
         std::cout << "[OpenMP] Valid: " << validate(C, C_ref, N, P) << std::endl;
+        std::cout << "[OpenMP] Time: " << (t1 - t0) << " s" << std::endl;
     } else if (mode == "block") {
-        matmul_block_tiling(A, B, C, N, M, P);
+        int block_size = 64;
+        t0 = omp_get_wtime();
+        matmul_block_tiling(A, B, C, N, M, P, block_size);
+        t1 = omp_get_wtime();
         std::cout << "[Block Parallel] Valid: " << validate(C, C_ref, N, P) << std::endl;
+        std::cout << "[Block Parallel] Time: " << (t1 - t0) << " s" << std::endl;
     } else if (mode == "other") {
+        t0 = omp_get_wtime();
         matmul_other(A, B, C, N, M, P);
+        t1 = omp_get_wtime();
         std::cout << "[Other] Valid: " << validate(C, C_ref, N, P) << std::endl;
+        std::cout << "[Other] Time: " << (t1 - t0) << " s" << std::endl;
     } else {
         std::cerr << "Usage: ./main [baseline|openmp|block|mpi]" << std::endl;
     }
