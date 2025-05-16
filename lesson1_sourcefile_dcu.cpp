@@ -78,16 +78,30 @@ int main() {
     dim3 blockDim(16, 16);
     dim3 gridDim((P + blockDim.x - 1) / blockDim.x, (N + blockDim.y - 1) / blockDim.y);
 
+    // 性能评测：计时
+    hipEvent_t start, stop;
+    hipEventCreate(&start);
+    hipEventCreate(&stop);
+    hipEventRecord(start, 0);
+
     hipLaunchKernelGGL(matmul_kernel, gridDim, blockDim, 0, 0, d_A, d_B, d_C, N, M, P);
+
+    hipEventRecord(stop, 0);
+    hipEventSynchronize(stop);
+    float elapsed_ms = 0;
+    hipEventElapsedTime(&elapsed_ms, start, stop);
 
     hipMemcpy(C.data(), d_C, size_C, hipMemcpyDeviceToHost);
 
-    
     if (validate(C_ref, C)) {
        std::cout << "[HIP] Valid: 1" << std::endl;
     } else {
        std::cout << "[HIP] Valid: 0" << std::endl;
     }
+    std::cout << "[HIP] Kernel Time: " << elapsed_ms / 1000.0 << " s" << std::endl;
+
+    hipEventDestroy(start);
+    hipEventDestroy(stop);
 
     hipFree(d_A);
     hipFree(d_B);
