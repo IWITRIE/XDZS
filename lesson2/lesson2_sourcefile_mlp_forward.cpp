@@ -1,4 +1,5 @@
 #include <hip/hip_runtime.h>
+#include <hipblas.h>  // 新增
 #include <iostream>
 #include <vector>
 #include <cstdlib>
@@ -180,7 +181,7 @@ int main() {
     hipMemcpy(d_W2, h_W2.data(), H * O * sizeof(double), hipMemcpyHostToDevice);
     hipMemcpy(d_B2, h_B2.data(), O * sizeof(double), hipMemcpyHostToDevice);
 
-    float time_naive = 0, time_opt = 0;
+    float time_naive = 0, time_opt = 0, time_blas = 0;
     // 朴素实现测时
     hipEventRecord(start);
     // Hidden layer (naive)
@@ -217,14 +218,61 @@ int main() {
     hipEventSynchronize(stop);
     hipEventElapsedTime(&time_opt, start, stop);
 
-    // 复制结果回主机（任选一种）
-    hipMemcpy(h_Y.data(), d_Y.data(), BATCH * O * sizeof(double), hipMemcpyDeviceToHost);
+    hipblasHandle_t handle;
+    hipblasCreate(&handle);  // 创建 BLAS handle
 
-    // 打印对比结果
-    std::cout << "Naive Forward Time: " << time_naive << " ms, "
-              << "Throughput: " << BATCH / (time_naive / 1000.0) << " samples/s\n";
-    std::cout << "Optimized Forward Time: " << time_opt << " ms, "
-              << "Throughput: " << BATCH / (time_opt / 1000.0) << " samples/s\n";
+    // 新增：为 BLAS 版本分配中间缓冲
+    double *d_H_blas, *d_Y_blas;
+    hipMalloc(&d_H_blas, BATCH * H * sizeof(double));
+    hipMalloc(&d_Y_blas, BATCH * O * sizeof(double));
+
+    // 拷贝输入和权重（同原逻辑）
+    hipMemcpy(d_X, h_X.data(), BATCH * I * sizeof(double), hipMemcpyHostToDevice);
+    hipMemcpy(d_W1, h_W1.data(), I * H * sizeof(double), hipMemcpyHostToDevice);
+    hipMemcpy(d_B1, h_B1.data(), H * sizeof(double), hipMemcpyHostToDevice);
+    hipMemcpy(d_W2, h_W2.data(), H * O * sizeof(double), hipMemcpyHostToDevice);
+    hipMemcpy(d_B2, h_B2.data(), O * sizeof(double), hipMemcpyHostToDevice);
+
+    // BLAS 版本测时
+    const double alpha = 1.0, beta = 0.0;
+    hipEventRecord(start);
+    // Hidden = X * W1
+    hipblasDgemm(handle,
+                 HIPBLAS_OP_N, HIPBLAS_OP_N,
+                 BATCH, H, I,
+                 &alpha,
+                 d_X, I,
+                 d_W1, H,
+                 &beta,
+                 d_H_blas, H);
+    // Add bias & ReLU
+    hipLaunchKernelGGL(add_bias_kernel, gridDim_bias1, 256, 0, 0,
+                       d_H_blas, d_B1, BATCH, H);
+    hipLaunchKernelGGL(relu_kernel, gridDim_bias1, 256, 0, 0,
+                       d_H_blas, BATCH * H);
+    // Y = H * W2
+    hipblasDgemm(handle,
+                 HIPBLAS_OP_N, HIPBLAS_OP_N,
+                 BATCH, O, H,
+                 &alpha,
+                 d_H_blas, H,
+                 d_W2, O,
+                 &beta,
+                 d_Y_blas, O);
+    // Add bias
+    hipLaunchKernelGGL(add_bias_kernel, gridDim_bias2, 256, 0, 0,
+                       d_Y_blas, d_B2, BATCH, O);
+    hipEventRecord(stop);
+    hipEventSynchronize(stop);
+    hipEventElapsedTime(&time_blas, start, stop);
+
+    // 输出对比
+    std::cout << "BLAS Forward Time:     " << time_blas
+              << " ms, Throughput: " << BATCH / (time_blas / 1000.0) << " samples/s\n";
+    std::cout << "Naive Forward Time:    " << time_naive
+              << " ms, Throughput: " << BATCH / (time_naive / 1000.0) << " samples/s\n";
+    std::cout << "Optimized Forward Time:" << time_opt
+              << " ms, Throughput: " << BATCH / (time_opt / 1000.0) << " samples/s\n";
 
     hipFree(d_X);
     hipFree(d_W1);
@@ -235,6 +283,9 @@ int main() {
     hipFree(d_Y);
     hipFree(d_H_naive);
     hipFree(d_Y_naive);
+    hipFree(d_H_blas);
+    hipFree(d_Y_blas);
+    hipblasDestroy(handle);  // 销毁 handle
 
     return 0;
 }
