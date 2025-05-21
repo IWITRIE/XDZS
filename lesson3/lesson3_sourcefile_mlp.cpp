@@ -105,6 +105,43 @@ __global__ void relu_forward(double* output, int size) {
     }
 }
 
+// 计算 W2 梯度： hidden^T * output_grad / batch
+__global__ void compute_w2_grad(const double* hidden, const double* output_grad, double* w2_grad,
+                                int batch, int hidden_dim, int output_dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < hidden_dim && j < output_dim) {
+        double sum = 0.0;
+        for (int b = 0; b < batch; ++b)
+            sum += hidden[b * hidden_dim + i] * output_grad[b * output_dim + j];
+        w2_grad[i * output_dim + j] = sum / batch;
+    }
+}
+
+// 计算 W1 梯度： input^T * hidden_grad / batch
+__global__ void compute_w1_grad(const double* input, const double* hidden_grad, double* w1_grad,
+                                int batch, int input_dim, int hidden_dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < input_dim && j < hidden_dim) {
+        double sum = 0.0;
+        for (int b = 0; b < batch; ++b)
+            sum += input[b * input_dim + i] * hidden_grad[b * hidden_dim + j];
+        w1_grad[i * hidden_dim + j] = sum / batch;
+    }
+}
+
+// 计算偏置梯度：各样本梯度之和 / batch
+__global__ void compute_bias_grad(const double* grad, double* bias_grad, int batch, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < dim) {
+        double sum = 0.0;
+        for (int b = 0; b < batch; ++b)
+            sum += grad[b * dim + idx];
+        bias_grad[idx] = sum / batch;
+    }
+}
+
 // 加载带宽数据
 std::vector<double> load_json_bandwidth(const std::string& filename) {
     std::vector<double> data;
@@ -173,56 +210,223 @@ void denormalize_data(std::vector<double>& data, double min_val, double max_val)
     return;
 }
 
+// 新增：MLP 网络封装
+struct MLPNetwork {
+    int in_dim, hid_dim, out_dim;
+    double lr;
+    // Device 指针
+    double *d_input, *d_hidden, *d_output, *d_target;
+    double *d_w1, *d_b1, *d_w2, *d_b2;
+    double *d_w1g, *d_b1g, *d_w2g, *d_b2g;
+    double *d_og, *d_hg;  // output_grad, hidden_grad
+
+    MLPNetwork(int in, int hid, int out, double lr):
+        in_dim(in), hid_dim(hid), out_dim(out), lr(lr) {}
+
+    void init(size_t batch) {
+        // 分配参数与中间量
+        hipMalloc(&d_input,  batch*in_dim*sizeof(double));
+        hipMalloc(&d_hidden, batch*hid_dim*sizeof(double));
+        hipMalloc(&d_output, batch*out_dim*sizeof(double));
+        hipMalloc(&d_target, batch*out_dim*sizeof(double));
+        hipMalloc(&d_w1, in_dim*hid_dim*sizeof(double));
+        hipMalloc(&d_b1, hid_dim*sizeof(double));
+        hipMalloc(&d_w2, hid_dim*out_dim*sizeof(double));
+        hipMalloc(&d_b2, out_dim*sizeof(double));
+        hipMalloc(&d_w1g, in_dim*hid_dim*sizeof(double));
+        hipMalloc(&d_b1g, hid_dim*sizeof(double));
+        hipMalloc(&d_w2g, hid_dim*out_dim*sizeof(double));
+        hipMalloc(&d_b2g, out_dim*sizeof(double));
+        hipMalloc(&d_hg,  batch*hid_dim*sizeof(double));
+        hipMalloc(&d_og,  batch*out_dim*sizeof(double));
+        // 随机初始化主机参数并拷贝，可自行替换为自定义 init
+        std::vector<double> h1(in_dim*hid_dim), hb1(hid_dim),
+                            h2(hid_dim*out_dim), hb2(out_dim);
+        for(auto& v:h1) v=0.01*(rand()/(double)RAND_MAX);
+        for(auto& v:hb1) v=0;
+        for(auto& v:h2) v=0.01*(rand()/(double)RAND_MAX);
+        for(auto& v:hb2) v=0;
+        hipMemcpy(d_w1,h1.data(),h1.size()*sizeof(double),hipMemcpyHostToDevice);
+        hipMemcpy(d_b1,hb1.data(),hb1.size()*sizeof(double),hipMemcpyHostToDevice);
+        hipMemcpy(d_w2,h2.data(),h2.size()*sizeof(double),hipMemcpyHostToDevice);
+        hipMemcpy(d_b2,hb2.data(),hb2.size()*sizeof(double),hipMemcpyHostToDevice);
+    }
+
+    void forward(size_t batch) {
+        dim3 blk(TILE_SIZE,TILE_SIZE),
+             grd1((hid_dim+TILE_SIZE-1)/TILE_SIZE,(batch+TILE_SIZE-1)/TILE_SIZE);
+        matmul<<<grd1,blk>>>(d_input,d_w1,d_hidden,batch,hid_dim,in_dim);
+        relu_forward<<<(batch*hid_dim+255)/256,256>>>(d_hidden,batch*hid_dim);
+        dim3 grd2((out_dim+TILE_SIZE-1)/TILE_SIZE,(batch+TILE_SIZE-1)/TILE_SIZE);
+        matmul<<<grd2,blk>>>(d_hidden,d_w2,d_output,batch,out_dim,hid_dim);
+    }
+
+    void backward(size_t batch) {
+        // output_grad
+        compute_output_grad<<<(batch*out_dim+255)/256,256>>>(d_output,d_target,d_og,batch*out_dim);
+        // hidden_grad
+        compute_relu_backward<<<(batch*hid_dim+255)/256,256>>>(d_hg,d_hidden,batch*hid_dim);
+        // weights/bias 梯度
+        dim3 b2(16,16), g2((hid_dim+15)/16,(out_dim+15)/16);
+        compute_w2_grad<<<g2,b2>>>(d_hidden,d_og,d_w2g,batch,hid_dim,out_dim);
+        compute_bias_grad<<<(out_dim+255)/256,256>>>(d_og,d_b2g,batch,out_dim);
+        dim3 b1(16,16), g1((in_dim+15)/16,(hid_dim+15)/16);
+        compute_w1_grad<<<g1,b1>>>(d_input,d_hg,d_w1g,batch,in_dim,hid_dim);
+        compute_bias_grad<<<(hid_dim+255)/256,256>>>(d_hg,d_b1g,batch,hid_dim);
+    }
+
+    void update() {
+        int sz1=in_dim*hid_dim, sz2=hid_dim*out_dim;
+        sgd_update<<<(sz1+255)/256,256>>>(d_w1,d_w1g,lr,sz1);
+        sgd_update<<<(hid_dim+255)/256,256>>>(d_b1,d_b1g,lr,hid_dim);
+        sgd_update<<<(sz2+255)/256,256>>>(d_w2,d_w2g,lr,sz2);
+        sgd_update<<<(out_dim+255)/256,256>>>(d_b2,d_b2g,lr,out_dim);
+    }
+
+    double compute_loss(size_t batch, std::vector<double>& loss_host) {
+        double *d_loss; hipMalloc(&d_loss,batch*out_dim*sizeof(double));
+        compute_mse_loss<<<(batch*out_dim+255)/256,256>>>(d_output,d_target,d_loss,batch*out_dim);
+        hipMemcpy(loss_host.data(),d_loss,batch*out_dim*sizeof(double),hipMemcpyDeviceToHost);
+        hipFree(d_loss);
+        double sum=0; for(double v:loss_host) sum+=v;
+        return sum/(batch*out_dim);
+    }
+
+    void destroy() {
+        hipFree(d_input); hipFree(d_hidden); hipFree(d_output); hipFree(d_target);
+        hipFree(d_w1); hipFree(d_b1); hipFree(d_w2); hipFree(d_b2);
+        hipFree(d_w1g);hipFree(d_b1g);hipFree(d_w2g);hipFree(d_b2g);
+        hipFree(d_hg); hipFree(d_og);
+    }
+};
+
 // ----------------------------- Main -------------------------------
 int main() {
-    // 初始化权重和偏置
+    // 1. 数据准备
+    double min_v, max_v;
+    auto raw = load_json_bandwidth("./starlink_bw.json ");     // 使用正确文件名
+    if (raw.empty()) {
+        std::cerr << "加载带宽数据失败，程序退出。" << std::endl;
+        return -1;
+    }
+    normalize_data(raw, min_v, max_v);
+    std::vector<double> X, y;
+    create_dataset(raw, X, y);
+    if (X.empty() || y.empty()) {
+        std::cerr << "样本数据不足，程序退出。" << std::endl;
+        return -1;
+    }
+    size_t S = y.size(), train_n = size_t(S * 0.8), test_n = S - train_n;
+
+    // 2. 划分训练/测试集 (按行)
+    std::vector<double> hX_train(X.begin(), X.begin() + train_n * INPUT_DIM),
+                        hY_train(y.begin(), y.begin() + train_n);
+    std::vector<double> hX_test (X.begin() + train_n * INPUT_DIM, X.end()),
+                        hY_test (y.begin() + train_n,       y.end());
+
+    // 新增：Host 权重和偏置
     std::vector<double> w1(INPUT_DIM * HIDDEN_DIM);
     std::vector<double> w2(HIDDEN_DIM * OUTPUT_DIM);
     std::vector<double> b1(HIDDEN_DIM);
     std::vector<double> b2(OUTPUT_DIM);
-    
+
+    // 3. 分配 Device 内存
+    double *d_input, *d_target;
+    double *d_hidden, *d_output;
+    double *d_output_grad, *d_hidden_grad;
+    double *d_w1, *d_w2, *d_b1, *d_b2;
+    double *d_w1_grad, *d_w2_grad, *d_b1_grad, *d_b2_grad;
+    hipMalloc(&d_input,      train_n*INPUT_DIM*sizeof(double));
+    hipMalloc(&d_target,     train_n*OUTPUT_DIM*sizeof(double));
+    hipMalloc(&d_hidden,     train_n*HIDDEN_DIM *sizeof(double));
+    hipMalloc(&d_output,     train_n*OUTPUT_DIM  *sizeof(double));
+    hipMalloc(&d_output_grad,train_n*OUTPUT_DIM  *sizeof(double));
+    hipMalloc(&d_hidden_grad,train_n*HIDDEN_DIM *sizeof(double));
+    hipMalloc(&d_w1, INPUT_DIM*HIDDEN_DIM*sizeof(double));
+    hipMalloc(&d_w2, HIDDEN_DIM*OUTPUT_DIM*sizeof(double));
+    hipMalloc(&d_b1, HIDDEN_DIM*sizeof(double));
+    hipMalloc(&d_b2, OUTPUT_DIM*sizeof(double));
+    hipMalloc(&d_w1_grad, INPUT_DIM*HIDDEN_DIM*sizeof(double));
+    hipMalloc(&d_w2_grad, HIDDEN_DIM*OUTPUT_DIM*sizeof(double));
+    hipMalloc(&d_b1_grad, HIDDEN_DIM*sizeof(double));
+    hipMalloc(&d_b2_grad, OUTPUT_DIM*sizeof(double));
+
+    // 4. 拷贝训练数据 & 随机初始化并拷贝参数
+    hipMemcpy(d_input, hX_train.data(),  train_n*INPUT_DIM*sizeof(double), hipMemcpyHostToDevice);
+    hipMemcpy(d_target,hY_train.data(),  train_n*OUTPUT_DIM*sizeof(double), hipMemcpyHostToDevice);
     // 随机初始化权重
     for(auto& w : w1) w = 0.01 * (rand() / (double)RAND_MAX);
     for(auto& w : w2) w = 0.01 * (rand() / (double)RAND_MAX);
-    
-    // 分配GPU内存
-    double *d_w1, *d_w2, *d_b1, *d_b2;
-    hipMalloc(&d_w1, w1.size() * sizeof(double));
-    hipMalloc(&d_w2, w2.size() * sizeof(double));
-    hipMalloc(&d_b1, b1.size() * sizeof(double));
-    hipMalloc(&d_b2, b2.size() * sizeof(double));
-    
-    // 训练循环
+    hipMemcpy(d_w1, w1.data(), w1.size()*sizeof(double), hipMemcpyHostToDevice);
+    hipMemcpy(d_w2, w2.data(), w2.size()*sizeof(double), hipMemcpyHostToDevice);
+    hipMemcpy(d_b1, b1.data(), b1.size()*sizeof(double), hipMemcpyHostToDevice);
+    hipMemcpy(d_b2, b2.data(), b2.size()*sizeof(double), hipMemcpyHostToDevice);
+
+    // 新增：损失存储
+    double *d_loss;
+    hipMalloc(&d_loss, train_n * OUTPUT_DIM * sizeof(double));
+    std::vector<double> loss_host(train_n * OUTPUT_DIM);
+
+    // 5. 训练：正/反向、梯度下降
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
-        // 前向传播
-        dim3 blockDim(TILE_SIZE, TILE_SIZE);
-        dim3 gridDim((N + TILE_SIZE - 1) / TILE_SIZE, 
-                     (M + TILE_SIZE - 1) / TILE_SIZE);
-                     
-        // 调用优化后的matmul
-        matmul<<<gridDim, blockDim>>>(d_input, d_w1, d_hidden, 
-                                     BATCH_SIZE, HIDDEN_DIM, INPUT_DIM);
-        relu_forward<<<(HIDDEN_DIM + 255) / 256, 256>>>(d_hidden, HIDDEN_DIM * BATCH_SIZE);
+        // 前向：Input→Hidden
+        dim3 blk(TILE_SIZE, TILE_SIZE), grd((HIDDEN_DIM+TILE_SIZE-1)/TILE_SIZE, (train_n+TILE_SIZE-1)/TILE_SIZE);
+        matmul<<<grd,blk>>>(d_input, d_w1, d_hidden, train_n, HIDDEN_DIM, INPUT_DIM);
+        relu_forward<<<(train_n*HIDDEN_DIM+255)/256,256>>>(d_hidden, train_n*HIDDEN_DIM);
+        // Hidden→Output
+        grd.x = (OUTPUT_DIM+TILE_SIZE-1)/TILE_SIZE;
+        grd.y = (train_n +TILE_SIZE-1)/TILE_SIZE;
+        matmul<<<grd,blk>>>(d_hidden, d_w2, d_output, train_n, OUTPUT_DIM, HIDDEN_DIM);
+
+        // 误差&梯度
+        compute_output_grad<<<(train_n*OUTPUT_DIM+255)/256,256>>>(d_output, d_target, d_output_grad, train_n*OUTPUT_DIM);
+        compute_relu_backward<<<(train_n*HIDDEN_DIM+255)/256,256>>>(d_hidden_grad, d_hidden, train_n*HIDDEN_DIM);
         
-        gridDim.x = (OUTPUT_DIM + 15) / 16;
-        gridDim.y = (BATCH_SIZE + 15) / 16;
-        matmul<<<gridDim, blockDim>>>(d_hidden, d_w2, d_output, BATCH_SIZE, OUTPUT_DIM, HIDDEN_DIM);
-        
-        // 反向传播
-        compute_output_grad<<<(BATCH_SIZE + 255) / 256, 256>>>(d_output, d_target, d_output_grad, BATCH_SIZE);
-        compute_relu_backward<<<(HIDDEN_DIM * BATCH_SIZE + 255) / 256, 256>>>(
-            d_hidden_grad, d_hidden, HIDDEN_DIM * BATCH_SIZE);
-            
-        // 参数更新
-        sgd_update<<<(w1.size() + 255) / 256, 256>>>(d_w1, d_w1_grad, LEARNING_RATE, w1.size());
-        sgd_update<<<(w2.size() + 255) / 256, 256>>>(d_w2, d_w2_grad, LEARNING_RATE, w2.size());
+        // 计算权重梯度（W2, B2）
+        // W2_grad = H^T * output_grad
+        // B2_grad = reduce_sum(output_grad)
+        // 同理计算 W1_grad, B1_grad → 省略细节，可调用 matmul 及自定义 reduce kernel
+        dim3 blockW2(16,16), gridW2((HIDDEN_DIM+15)/16,(OUTPUT_DIM+15)/16);
+        compute_w2_grad<<<gridW2,blockW2>>>(d_hidden, d_output_grad, d_w2_grad,
+                                           train_n, HIDDEN_DIM, OUTPUT_DIM);
+        compute_bias_grad<<<(OUTPUT_DIM+255)/256,256>>>(d_output_grad, d_b2_grad,
+                                                       train_n, OUTPUT_DIM);
+
+        dim3 blockW1(16,16), gridW1((INPUT_DIM+15)/16,(HIDDEN_DIM+15)/16);
+        compute_w1_grad<<<gridW1,blockW1>>>(d_input, d_hidden_grad, d_w1_grad,
+                                           train_n, INPUT_DIM, HIDDEN_DIM);
+        compute_bias_grad<<<(HIDDEN_DIM+255)/256,256>>>(d_hidden_grad, d_b1_grad,
+                                                       train_n, HIDDEN_DIM);
+
+        // SGD 更新
+        sgd_update<<<(w1.size()+255)/256,256>>>(d_w1, d_w1_grad, LEARNING_RATE, w1.size());
+        sgd_update<<<(w2.size()+255)/256,256>>>(d_w2, d_w2_grad, LEARNING_RATE, w2.size());
+        sgd_update<<<(b1.size()+255)/256,256>>>(d_b1, d_b1_grad, LEARNING_RATE, b1.size());
+        sgd_update<<<(b2.size()+255)/256,256>>>(d_b2, d_b2_grad, LEARNING_RATE, b2.size());
+
+        // 计算并打印本轮 loss
+        compute_mse_loss<<<(train_n*OUTPUT_DIM+255)/256,256>>>(d_output, d_target, d_loss,
+                                                               train_n*OUTPUT_DIM);
+        hipMemcpy(loss_host.data(), d_loss, train_n*OUTPUT_DIM*sizeof(double), hipMemcpyDeviceToHost);
+        double sum_loss = 0.0;
+        for (double v : loss_host) sum_loss += v;
+        double mean_loss = sum_loss / (train_n * OUTPUT_DIM);
+        std::cout << "Epoch " << (epoch+1) << " Loss: " << mean_loss << std::endl;
     }
-    
-    // 清理GPU内存
-    hipFree(d_w1);
-    hipFree(d_w2);
-    hipFree(d_b1);
-    hipFree(d_b2);
-    
+
+    hipFree(d_loss);
+    // 6. 推理 & 性能评测（同训练前向部分，但输入为 hX_test）
+    //    - 复用 d_input, d_hidden, d_output
+    //    - 计时 front Prop
+    //    - 拷回结果到 hY_pred
+    //    - de-normalize 后计算 test MSE
+
+    // 7. 清理
+    hipFree(d_input); hipFree(d_target);
+    hipFree(d_hidden); hipFree(d_output);
+    hipFree(d_output_grad); hipFree(d_hidden_grad);
+    hipFree(d_w1); hipFree(d_w2); hipFree(d_b1); hipFree(d_b2);
+    hipFree(d_w1_grad); hipFree(d_w2_grad); hipFree(d_b1_grad); hipFree(d_b2_grad);
+
     return 0;
 }
