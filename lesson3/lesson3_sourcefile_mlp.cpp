@@ -114,20 +114,18 @@ std::vector<double> load_json_bandwidth(const std::string& filename) {
         return data;
     }
 
-    std::string line, all;
-    while (std::getline(file, line)) {
-        all += line;
-    }
-
+    std::string line;
+    std::getline(file, line);
+    
     // 移除开头的 '[' 和结尾的 ']'
-    size_t start = all.find('[');
-    size_t end = all.find_last_of(']');
+    size_t start = line.find('[');
+    size_t end = line.find_last_of(']');
     if (start != std::string::npos && end != std::string::npos) {
-        all = all.substr(start + 1, end - start - 1);
+        line = line.substr(start + 1, end - start - 1);
     }
 
     // 按逗号分割并解析数字
-    std::stringstream ss(all);
+    std::stringstream ss(line);
     std::string token;
     while (std::getline(ss, token, ',')) {
         // 移除空格
@@ -175,21 +173,6 @@ void denormalize_data(std::vector<double>& data, double min_val, double max_val)
     return;
 }
 
-// 新增：计算 w2 梯度的 kernel（假设 output_grad: [BATCH_SIZE, OUTPUT_DIM], hidden: [BATCH_SIZE, HIDDEN_DIM]）
-__global__ void compute_w2_grad(const double* hidden, const double* output_grad, double* w2_grad, int batch, int hidden_dim, int output_dim) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x; // hidden_dim
-    int j = blockIdx.y * blockDim.y + threadIdx.y; // output_dim
-    if (i < hidden_dim && j < output_dim) {
-        double sum = 0.0;
-        for (int b = 0; b < batch; ++b) {
-            sum += hidden[b * hidden_dim + i] * output_grad[b * output_dim + j];
-        }
-        w2_grad[i * output_dim + j] = sum / batch;
-    }
-}
-
-// 新增：计算 w1 梯度的 kernel（可用类似方式实现）
-
 // ----------------------------- Main -------------------------------
 int main() {
     // 初始化权重和偏置
@@ -197,138 +180,49 @@ int main() {
     std::vector<double> w2(HIDDEN_DIM * OUTPUT_DIM);
     std::vector<double> b1(HIDDEN_DIM);
     std::vector<double> b2(OUTPUT_DIM);
-
+    
     // 随机初始化权重
     for(auto& w : w1) w = 0.01 * (rand() / (double)RAND_MAX);
     for(auto& w : w2) w = 0.01 * (rand() / (double)RAND_MAX);
-
-    // 加载数据
-    std::vector<double> raw_data = load_json_bandwidth("/root/XDZS/lesson3/starlink_bw.json");
-    if (raw_data.empty()) {
-        std::cerr << "数据加载失败，程序退出。" << std::endl;
-        return -1;
-    }
-
-    // 归一化
-    double min_val, max_val;
-    normalize_data(raw_data, min_val, max_val);
-
-    // 构建数据集
-    std::vector<double> X;
-    std::vector<double> y;
-    create_dataset(raw_data, X, y);
-
-    // 分配输入、隐藏层、输出、目标、梯度等主机和设备内存
-    std::vector<double> hidden(BATCH_SIZE * HIDDEN_DIM);
-    std::vector<double> output(BATCH_SIZE * OUTPUT_DIM);
-    std::vector<double> target(BATCH_SIZE * OUTPUT_DIM);
-    std::vector<double> hidden_grad(BATCH_SIZE * HIDDEN_DIM, 0.0);
-    std::vector<double> output_grad(BATCH_SIZE * OUTPUT_DIM, 0.0);
-    std::vector<double> w1_grad(INPUT_DIM * HIDDEN_DIM, 0.0);
-    std::vector<double> w2_grad(HIDDEN_DIM * OUTPUT_DIM, 0.0);
-
-    double *d_input, *d_hidden, *d_output, *d_target;
-    double *d_hidden_grad, *d_output_grad, *d_w1_grad, *d_w2_grad;
+    
+    // 分配GPU内存
     double *d_w1, *d_w2, *d_b1, *d_b2;
-
-    hipMalloc(&d_input, BATCH_SIZE * INPUT_DIM * sizeof(double));
-    hipMalloc(&d_hidden, BATCH_SIZE * HIDDEN_DIM * sizeof(double));
-    hipMalloc(&d_output, BATCH_SIZE * OUTPUT_DIM * sizeof(double));
-    hipMalloc(&d_target, BATCH_SIZE * OUTPUT_DIM * sizeof(double));
-    hipMalloc(&d_hidden_grad, BATCH_SIZE * HIDDEN_DIM * sizeof(double));
-    hipMalloc(&d_output_grad, BATCH_SIZE * OUTPUT_DIM * sizeof(double));
-    hipMalloc(&d_w1_grad, INPUT_DIM * HIDDEN_DIM * sizeof(double));
-    hipMalloc(&d_w2_grad, HIDDEN_DIM * OUTPUT_DIM * sizeof(double));
     hipMalloc(&d_w1, w1.size() * sizeof(double));
     hipMalloc(&d_w2, w2.size() * sizeof(double));
     hipMalloc(&d_b1, b1.size() * sizeof(double));
     hipMalloc(&d_b2, b2.size() * sizeof(double));
-
-    // 拷贝权重到设备
-    hipMemcpy(d_w1, w1.data(), w1.size() * sizeof(double), hipMemcpyHostToDevice);
-    hipMemcpy(d_w2, w2.data(), w2.size() * sizeof(double), hipMemcpyHostToDevice);
-    // ...如有需要，拷贝b1, b2...
-
-    // 分配loss相关内存
-    std::vector<double> loss_host(BATCH_SIZE * OUTPUT_DIM);
-    double *d_loss;
-    hipMalloc(&d_loss, BATCH_SIZE * OUTPUT_DIM * sizeof(double));
-
+    
     // 训练循环
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
-        // 每次处理BATCH_SIZE个样本
-        hipMemcpy(d_input, X.data(), BATCH_SIZE * INPUT_DIM * sizeof(double), hipMemcpyHostToDevice);
-        hipMemcpy(d_target, y.data(), BATCH_SIZE * OUTPUT_DIM * sizeof(double), hipMemcpyHostToDevice);
-
         // 前向传播
         dim3 blockDim(TILE_SIZE, TILE_SIZE);
-        dim3 gridDim1((HIDDEN_DIM + TILE_SIZE - 1) / TILE_SIZE, 
-                      (BATCH_SIZE + TILE_SIZE - 1) / TILE_SIZE);
-
-        matmul<<<gridDim1, blockDim>>>(d_input, d_w1, d_hidden, 
-                                       BATCH_SIZE, HIDDEN_DIM, INPUT_DIM);
-        relu_forward<<<(HIDDEN_DIM * BATCH_SIZE + 255) / 256, 256>>>(d_hidden, HIDDEN_DIM * BATCH_SIZE);
-
-        dim3 gridDim2((OUTPUT_DIM + TILE_SIZE - 1) / TILE_SIZE, 
-                      (BATCH_SIZE + TILE_SIZE - 1) / TILE_SIZE);
-        matmul<<<gridDim2, blockDim>>>(d_hidden, d_w2, d_output, BATCH_SIZE, OUTPUT_DIM, HIDDEN_DIM);
-
+        dim3 gridDim((N + TILE_SIZE - 1) / TILE_SIZE, 
+                     (M + TILE_SIZE - 1) / TILE_SIZE);
+                     
+        // 调用优化后的matmul
+        matmul<<<gridDim, blockDim>>>(d_input, d_w1, d_hidden, 
+                                     BATCH_SIZE, HIDDEN_DIM, INPUT_DIM);
+        relu_forward<<<(HIDDEN_DIM + 255) / 256, 256>>>(d_hidden, HIDDEN_DIM * BATCH_SIZE);
+        
+        gridDim.x = (OUTPUT_DIM + 15) / 16;
+        gridDim.y = (BATCH_SIZE + 15) / 16;
+        matmul<<<gridDim, blockDim>>>(d_hidden, d_w2, d_output, BATCH_SIZE, OUTPUT_DIM, HIDDEN_DIM);
+        
         // 反向传播
-        // 1. 输出层梯度
-        compute_output_grad<<<(BATCH_SIZE * OUTPUT_DIM + 255) / 256, 256>>>(d_output, d_target, d_output_grad, BATCH_SIZE * OUTPUT_DIM);
-
-        // 2. 计算 w2_grad: hidden^T * output_grad / BATCH_SIZE
-        // hidden: [BATCH_SIZE, HIDDEN_DIM], output_grad: [BATCH_SIZE, OUTPUT_DIM]
-        // w2_grad: [HIDDEN_DIM, OUTPUT_DIM]
-        dim3 blockW2(16, 16);
-        dim3 gridW2((HIDDEN_DIM + 15) / 16, (OUTPUT_DIM + 15) / 16);
-        matmul<<<gridW2, blockW2>>>(d_hidden, d_output_grad, d_w2_grad, HIDDEN_DIM, OUTPUT_DIM, BATCH_SIZE); // 注意：需要转置hidden
-        // 由于matmul没有转置功能，这里建议实现转置或写一个转置kernel。简化起见，建议在主机端先转置hidden再拷贝到设备，或实现转置kernel。
-
-        // 3. 反向传播到隐藏层
-        // hidden_grad = output_grad * w2^T
-        dim3 gridDim3((HIDDEN_DIM + TILE_SIZE - 1) / TILE_SIZE, 
-                      (BATCH_SIZE + TILE_SIZE - 1) / TILE_SIZE);
-        matmul<<<gridDim3, blockDim>>>(d_output_grad, d_w2, d_hidden_grad, BATCH_SIZE, HIDDEN_DIM, OUTPUT_DIM);
-
-        // 4. relu反向
-        compute_relu_backward<<<(HIDDEN_DIM * BATCH_SIZE + 255) / 256, 256>>>(d_hidden_grad, d_hidden, HIDDEN_DIM * BATCH_SIZE);
-
-        // 5. 计算 w1_grad: input^T * hidden_grad / BATCH_SIZE
-        // input: [BATCH_SIZE, INPUT_DIM], hidden_grad: [BATCH_SIZE, HIDDEN_DIM]
-        // w1_grad: [INPUT_DIM, HIDDEN_DIM]
-        dim3 blockW1(16, 16);
-        dim3 gridW1((INPUT_DIM + 15) / 16, (HIDDEN_DIM + 15) / 16);
-        matmul<<<gridW1, blockW1>>>(d_input, d_hidden_grad, d_w1_grad, INPUT_DIM, HIDDEN_DIM, BATCH_SIZE); // 同样需要input转置
-
-        // 6. 参数更新
+        compute_output_grad<<<(BATCH_SIZE + 255) / 256, 256>>>(d_output, d_target, d_output_grad, BATCH_SIZE);
+        compute_relu_backward<<<(HIDDEN_DIM * BATCH_SIZE + 255) / 256, 256>>>(
+            d_hidden_grad, d_hidden, HIDDEN_DIM * BATCH_SIZE);
+            
+        // 参数更新
         sgd_update<<<(w1.size() + 255) / 256, 256>>>(d_w1, d_w1_grad, LEARNING_RATE, w1.size());
         sgd_update<<<(w2.size() + 255) / 256, 256>>>(d_w2, d_w2_grad, LEARNING_RATE, w2.size());
-
-        // 计算并打印loss
-        compute_mse_loss<<<(BATCH_SIZE * OUTPUT_DIM + 255) / 256, 256>>>(d_output, d_target, d_loss, BATCH_SIZE * OUTPUT_DIM);
-        hipMemcpy(loss_host.data(), d_loss, BATCH_SIZE * OUTPUT_DIM * sizeof(double), hipMemcpyDeviceToHost);
-        double loss_sum = 0.0;
-        for (int i = 0; i < BATCH_SIZE * OUTPUT_DIM; ++i) loss_sum += loss_host[i];
-        double loss_mean = loss_sum / (BATCH_SIZE * OUTPUT_DIM);
-        if (epoch % 10 == 0 || epoch == EPOCHS - 1)
-            std::cout << "Epoch " << epoch << ", Loss: " << loss_mean << std::endl;
     }
-
+    
     // 清理GPU内存
-    hipFree(d_input);
-    hipFree(d_hidden);
-    hipFree(d_output);
-    hipFree(d_target);
-    hipFree(d_hidden_grad);
-    hipFree(d_output_grad);
-    hipFree(d_w1_grad);
-    hipFree(d_w2_grad);
     hipFree(d_w1);
     hipFree(d_w2);
     hipFree(d_b1);
     hipFree(d_b2);
-    hipFree(d_loss);
-
+    
     return 0;
 }

@@ -57,6 +57,19 @@ __global__ void matmul_kernel(const double* A, const double* B, double* C, int M
         C[row * K + col] = sum;
 }
 
+// 新增：朴素矩阵乘法kernel，用于性能对比
+__global__ void matmul_naive_kernel(const double* A, const double* B, double* C, int M, int N, int K) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M && col < K) {
+        double sum = 0.0;
+        for (int i = 0; i < N; ++i) {
+            sum += A[row * N + i] * B[i * K + col];
+        }
+        C[row * K + col] = sum;
+    }
+}
+
 __global__ void relu_kernel(double* A, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
@@ -155,6 +168,64 @@ int main() {
         std::cout << std::endl;
     }
 
+    // 新增：为朴素实现分配中间缓冲
+    double *d_H_naive, *d_Y_naive;
+    hipMalloc(&d_H_naive, BATCH * H * sizeof(double));
+    hipMalloc(&d_Y_naive, BATCH * O * sizeof(double));
+
+    // 拷贝输入和权重（同原逻辑）
+    hipMemcpy(d_X, h_X.data(), BATCH * I * sizeof(double), hipMemcpyHostToDevice);
+    hipMemcpy(d_W1, h_W1.data(), I * H * sizeof(double), hipMemcpyHostToDevice);
+    hipMemcpy(d_B1, h_B1.data(), H * sizeof(double), hipMemcpyHostToDevice);
+    hipMemcpy(d_W2, h_W2.data(), H * O * sizeof(double), hipMemcpyHostToDevice);
+    hipMemcpy(d_B2, h_B2.data(), O * sizeof(double), hipMemcpyHostToDevice);
+
+    float time_naive = 0, time_opt = 0;
+    // 朴素实现测时
+    hipEventRecord(start);
+    // Hidden layer (naive)
+    hipLaunchKernelGGL(matmul_naive_kernel, gridDim1, blockDim, 0, 0,
+                       d_X, d_W1, d_H_naive, BATCH, I, H);
+    hipLaunchKernelGGL(add_bias_kernel, gridDim_bias1, 256, 0, 0,
+                       d_H_naive, d_B1, BATCH, H);
+    hipLaunchKernelGGL(relu_kernel, gridDim_bias1, 256, 0, 0,
+                       d_H_naive, BATCH * H);
+    // Output layer (naive)
+    hipLaunchKernelGGL(matmul_naive_kernel, gridDim2, blockDim, 0, 0,
+                       d_H_naive, d_W2, d_Y_naive, BATCH, H, O);
+    hipLaunchKernelGGL(add_bias_kernel, gridDim_bias2, 256, 0, 0,
+                       d_Y_naive, d_B2, BATCH, O);
+    hipEventRecord(stop);
+    hipEventSynchronize(stop);
+    hipEventElapsedTime(&time_naive, start, stop);
+
+    // 优化实现测时（原有 tiled + shared memory）
+    hipEventRecord(start);
+    // Hidden layer (opt)
+    hipLaunchKernelGGL(matmul_kernel, gridDim1, blockDim, 0, 0,
+                       d_X, d_W1, d_H, BATCH, I, H);
+    hipLaunchKernelGGL(add_bias_kernel, gridDim_bias1, 256, 0, 0,
+                       d_H, d_B1, BATCH, H);
+    hipLaunchKernelGGL(relu_kernel, gridDim_bias1, 256, 0, 0,
+                       d_H, BATCH * H);
+    // Output layer (opt)
+    hipLaunchKernelGGL(matmul_kernel, gridDim2, blockDim, 0, 0,
+                       d_H, d_W2, d_Y, BATCH, H, O);
+    hipLaunchKernelGGL(add_bias_kernel, gridDim_bias2, 256, 0, 0,
+                       d_Y, d_B2, BATCH, O);
+    hipEventRecord(stop);
+    hipEventSynchronize(stop);
+    hipEventElapsedTime(&time_opt, start, stop);
+
+    // 复制结果回主机（任选一种）
+    hipMemcpy(h_Y.data(), d_Y.data(), BATCH * O * sizeof(double), hipMemcpyDeviceToHost);
+
+    // 打印对比结果
+    std::cout << "Naive Forward Time: " << time_naive << " ms, "
+              << "Throughput: " << BATCH / (time_naive / 1000.0) << " samples/s\n";
+    std::cout << "Optimized Forward Time: " << time_opt << " ms, "
+              << "Throughput: " << BATCH / (time_opt / 1000.0) << " samples/s\n";
+
     hipFree(d_X);
     hipFree(d_W1);
     hipFree(d_B1);
@@ -162,6 +233,8 @@ int main() {
     hipFree(d_W2);
     hipFree(d_B2);
     hipFree(d_Y);
+    hipFree(d_H_naive);
+    hipFree(d_Y_naive);
 
     return 0;
 }
