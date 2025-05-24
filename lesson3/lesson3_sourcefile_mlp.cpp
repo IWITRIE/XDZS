@@ -7,6 +7,7 @@
 #include <string>
 #include <sstream>
 #include <algorithm>
+#include <iomanip>  // 添加这个头文件用于 std::setprecision
 
 // 编译文件
 // hipcc sourcefile_mlp.cpp -o mlp_full_dcu
@@ -18,15 +19,15 @@
 #define HIDDEN_DIM 32
 #define OUTPUT_DIM 1
 #define BATCH_SIZE 256
-#define EPOCHS 200
-#define LEARNING_RATE 1e-4
-#define TILE_SIZE 16  // 添加在其他宏定义之后
+#define EPOCHS 10000
+#define LEARNING_RATE 3e-3
+#define TILE_SIZE 16  // 修改为16以避免超出限制
 
 
 // 以下函数和main函数均不为固定形式，可自行按照需求修改
 
 // HIP kernels函数形式，需要自行设计
-__global__ void matmul(const double* A, const double* B, double* C, int M, int N, int K) {
+__global__ void __launch_bounds__(256) matmul(const double* A, const double* B, double* C, int M, int N, int K) {
     __shared__ double As[TILE_SIZE][TILE_SIZE];
     __shared__ double Bs[TILE_SIZE][TILE_SIZE];
     
@@ -69,28 +70,28 @@ __global__ void matmul(const double* A, const double* B, double* C, int M, int N
     }
 }
 
-__global__ void compute_output_grad(const double* pred, const double* target, double* grad, int size) {
+__global__ void __launch_bounds__(256) compute_output_grad(const double* pred, const double* target, double* grad, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         grad[idx] = 2.0 * (pred[idx] - target[idx]);
     }
 }
 
-__global__ void compute_relu_backward(double* delta, const double* activ, int size) {
+__global__ void __launch_bounds__(256) compute_relu_backward(double* delta, const double* activ, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         delta[idx] = activ[idx] > 0 ? delta[idx] : 0;
     }
 }
 
-__global__ void compute_mse_loss(const double* pred, const double* target, double* loss, int size) {
+__global__ void __launch_bounds__(256) compute_mse_loss(const double* pred, const double* target, double* loss, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         loss[idx] = (pred[idx] - target[idx]) * (pred[idx] - target[idx]);
     }
 }
 
-__global__ void sgd_update(double* weights, const double* grad, double lr, int size) {
+__global__ void __launch_bounds__(256) sgd_update(double* weights, const double* grad, double lr, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         weights[idx] -= lr * grad[idx];
@@ -98,7 +99,7 @@ __global__ void sgd_update(double* weights, const double* grad, double lr, int s
 }
 
 // 添加ReLU激活函数的kernel
-__global__ void relu_forward(double* output, int size) {
+__global__ void __launch_bounds__(256) relu_forward(double* output, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         output[idx] = output[idx] > 0 ? output[idx] : 0;
@@ -106,7 +107,7 @@ __global__ void relu_forward(double* output, int size) {
 }
 
 // 计算 W2 梯度： hidden^T * output_grad / batch
-__global__ void compute_w2_grad(const double* hidden, const double* output_grad, double* w2_grad,
+__global__ void __launch_bounds__(256) compute_w2_grad(const double* hidden, const double* output_grad, double* w2_grad,
                                 int batch, int hidden_dim, int output_dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -119,7 +120,7 @@ __global__ void compute_w2_grad(const double* hidden, const double* output_grad,
 }
 
 // 计算 W1 梯度： input^T * hidden_grad / batch
-__global__ void compute_w1_grad(const double* input, const double* hidden_grad, double* w1_grad,
+__global__ void __launch_bounds__(256) compute_w1_grad(const double* input, const double* hidden_grad, double* w1_grad,
                                 int batch, int input_dim, int hidden_dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -132,13 +133,38 @@ __global__ void compute_w1_grad(const double* input, const double* hidden_grad, 
 }
 
 // 计算偏置梯度：各样本梯度之和 / batch
-__global__ void compute_bias_grad(const double* grad, double* bias_grad, int batch, int dim) {
+__global__ void __launch_bounds__(256) compute_bias_grad(const double* grad, double* bias_grad, int batch, int dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < dim) {
         double sum = 0.0;
         for (int b = 0; b < batch; ++b)
             sum += grad[b * dim + idx];
         bias_grad[idx] = sum / batch;
+    }
+}
+
+// 添加偏置加法kernel
+__global__ void __launch_bounds__(256) add_bias(double* output, const double* bias, int batch_size, int output_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * output_dim) {
+        int bias_idx = idx % output_dim;
+        output[idx] += bias[bias_idx];
+    }
+}
+
+// 修正反向传播中的hidden_grad计算
+__global__ void __launch_bounds__(256) compute_hidden_grad_from_output(const double* output_grad, const double* w2, 
+                                               double* hidden_grad, int batch, int hidden_dim, int output_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch * hidden_dim) {
+        int batch_idx = idx / hidden_dim;
+        int hidden_idx = idx % hidden_dim;
+        
+        double sum = 0.0;
+        for (int o = 0; o < output_dim; ++o) {
+            sum += output_grad[batch_idx * output_dim + o] * w2[hidden_idx * output_dim + o];
+        }
+        hidden_grad[idx] = sum;
     }
 }
 
@@ -214,11 +240,16 @@ void denormalize_data(std::vector<double>& data, double min_val, double max_val)
 int main() {
     // 1. 数据准备
     double min_v, max_v;
-    auto raw = load_json_bandwidth("./starlink_bw.json ");     // 使用正确文件名
+    auto raw = load_json_bandwidth("./starlink_bw.json");
     if (raw.empty()) {
         std::cerr << "加载带宽数据失败，程序退出。" << std::endl;
         return -1;
     }
+    
+    std::cout << "原始数据范围: [" << *std::min_element(raw.begin(), raw.end()) 
+              << ", " << *std::max_element(raw.begin(), raw.end()) << "]" << std::endl;
+    std::cout << "原始数据大小: " << raw.size() << std::endl;
+    
     normalize_data(raw, min_v, max_v);
     std::vector<double> X, y;
     create_dataset(raw, X, y);
@@ -234,11 +265,18 @@ int main() {
     std::vector<double> hX_test (X.begin() + train_n * INPUT_DIM, X.end()),
                         hY_test (y.begin() + train_n,       y.end());
 
-    // 新增：Host 权重和偏置
+    // 新增：Host 权重和偏置 - 使用更好的初始化
     std::vector<double> w1(INPUT_DIM * HIDDEN_DIM);
     std::vector<double> w2(HIDDEN_DIM * OUTPUT_DIM);
-    std::vector<double> b1(HIDDEN_DIM);
-    std::vector<double> b2(OUTPUT_DIM);
+    std::vector<double> b1(HIDDEN_DIM, 0.0);  // 偏置初始化为0
+    std::vector<double> b2(OUTPUT_DIM, 0.0);
+
+    // Xavier初始化
+    double xavier_w1 = sqrt(2.0 / (INPUT_DIM + HIDDEN_DIM));
+    double xavier_w2 = sqrt(2.0 / (HIDDEN_DIM + OUTPUT_DIM));
+    
+    for(auto& w : w1) w = xavier_w1 * (2.0 * rand() / RAND_MAX - 1.0);
+    for(auto& w : w2) w = xavier_w2 * (2.0 * rand() / RAND_MAX - 1.0);
 
     // 3. 分配 Device 内存
     double *d_input, *d_target;
@@ -276,20 +314,31 @@ int main() {
     double *d_loss;
     hipMalloc(&d_loss, train_n * OUTPUT_DIM * sizeof(double));
     std::vector<double> loss_host(train_n * OUTPUT_DIM);
+    
+    // 新增：训练损失记录
+    std::vector<double> epoch_losses;
+    std::vector<int> epoch_numbers;
 
     // 5. 训练：正/反向、梯度下降
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
         // 前向：Input→Hidden
         dim3 blk(TILE_SIZE, TILE_SIZE), grd((HIDDEN_DIM+TILE_SIZE-1)/TILE_SIZE, (train_n+TILE_SIZE-1)/TILE_SIZE);
         matmul<<<grd,blk>>>(d_input, d_w1, d_hidden, train_n, HIDDEN_DIM, INPUT_DIM);
+        add_bias<<<(train_n*HIDDEN_DIM+255)/256,256>>>(d_hidden, d_b1, train_n, HIDDEN_DIM);
         relu_forward<<<(train_n*HIDDEN_DIM+255)/256,256>>>(d_hidden, train_n*HIDDEN_DIM);
+        
         // Hidden→Output
         grd.x = (OUTPUT_DIM+TILE_SIZE-1)/TILE_SIZE;
         grd.y = (train_n +TILE_SIZE-1)/TILE_SIZE;
         matmul<<<grd,blk>>>(d_hidden, d_w2, d_output, train_n, OUTPUT_DIM, HIDDEN_DIM);
+        add_bias<<<(train_n*OUTPUT_DIM+255)/256,256>>>(d_output, d_b2, train_n, OUTPUT_DIM);
 
         // 误差&梯度
         compute_output_grad<<<(train_n*OUTPUT_DIM+255)/256,256>>>(d_output, d_target, d_output_grad, train_n*OUTPUT_DIM);
+        
+        // 修正反向传播：先计算hidden_grad，再应用ReLU反向
+        compute_hidden_grad_from_output<<<(train_n*HIDDEN_DIM+255)/256,256>>>(
+            d_output_grad, d_w2, d_hidden_grad, train_n, HIDDEN_DIM, OUTPUT_DIM);
         compute_relu_backward<<<(train_n*HIDDEN_DIM+255)/256,256>>>(d_hidden_grad, d_hidden, train_n*HIDDEN_DIM);
         
         // 计算权重梯度（W2, B2）
@@ -314,60 +363,99 @@ int main() {
         sgd_update<<<(b1.size()+255)/256,256>>>(d_b1, d_b1_grad, LEARNING_RATE, b1.size());
         sgd_update<<<(b2.size()+255)/256,256>>>(d_b2, d_b2_grad, LEARNING_RATE, b2.size());
 
-        // 计算并打印本轮 loss
-        compute_mse_loss<<<(train_n*OUTPUT_DIM+255)/256,256>>>(d_output, d_target, d_loss,
-                                                               train_n*OUTPUT_DIM);
-        hipMemcpy(loss_host.data(), d_loss, train_n*OUTPUT_DIM*sizeof(double), hipMemcpyDeviceToHost);
-        double sum_loss = 0.0;
-        for (double v : loss_host) sum_loss += v;
-        double mean_loss = sum_loss / (train_n * OUTPUT_DIM);
-        std::cout << "Epoch " << (epoch+1) << " Loss: " << mean_loss << std::endl;
+        // 计算本轮 loss (每10轮记录一次以减少开销)
+        if (epoch % 10 == 0 || epoch < 2000) {
+            compute_mse_loss<<<(train_n*OUTPUT_DIM+255)/256,256>>>(d_output, d_target, d_loss,
+                                                                   train_n*OUTPUT_DIM);
+            hipMemcpy(loss_host.data(), d_loss, train_n*OUTPUT_DIM*sizeof(double), hipMemcpyDeviceToHost);
+            double sum_loss = 0.0;
+            for (double v : loss_host) sum_loss += v;
+            double mean_loss = sum_loss / (train_n * OUTPUT_DIM);
+            
+            // 保存损失值和轮数
+            epoch_losses.push_back(mean_loss);
+            epoch_numbers.push_back(epoch + 1);
+            
+            // 打印进度 (每100轮打印一次)
+            if (epoch % 100 == 0) {
+                std::cout << "Epoch " << (epoch+1) << " Loss: " << mean_loss << std::endl;
+            }
+        }
     }
+
+    // 保存训练损失历史到CSV文件
+    std::ofstream loss_file("training_loss_history.csv");
+    loss_file << "Epoch,Loss\n";
+    for (size_t i = 0; i < epoch_losses.size(); ++i) {
+        loss_file << epoch_numbers[i] << "," << std::fixed << std::setprecision(8) << epoch_losses[i] << "\n";
+    }
+    loss_file.close();
+    std::cout << "训练损失历史已保存到 training_loss_history.csv" << std::endl;
 
     hipFree(d_loss);
     
-    // 6. 推理 & 性能评测
-    std::cout << "开始推理..." << std::endl;
+    // 6. 改进的滑动窗口预测
+    std::cout << "\n开始滑动窗口预测..." << std::endl;
+    std::cout << "训练样本数: " << train_n << ", 测试样本数: " << test_n << std::endl;
     
-    // 重新分配输入内存用于测试数据
-    double *d_test_input, *d_test_hidden, *d_test_output;
-    hipMalloc(&d_test_input, test_n*INPUT_DIM*sizeof(double));
-    hipMalloc(&d_test_hidden, test_n*HIDDEN_DIM*sizeof(double));
-    hipMalloc(&d_test_output, test_n*OUTPUT_DIM*sizeof(double));
+    // 使用滑动窗口进行逐步预测
+    std::vector<double> sliding_predictions;
+    std::vector<double> sliding_true_values;
+    std::vector<size_t> sliding_positions;
     
-    // 拷贝测试数据
-    hipMemcpy(d_test_input, hX_test.data(), test_n*INPUT_DIM*sizeof(double), hipMemcpyHostToDevice);
+    // 分配单个样本的GPU内存
+    double *d_single_input, *d_single_hidden, *d_single_output;
+    hipMalloc(&d_single_input, INPUT_DIM*sizeof(double));
+    hipMalloc(&d_single_hidden, HIDDEN_DIM*sizeof(double));
+    hipMalloc(&d_single_output, OUTPUT_DIM*sizeof(double));
     
-    // 开始计时
     auto start_time = std::chrono::high_resolution_clock::now();
     
-    // 推理前向传播
-    dim3 blk(TILE_SIZE, TILE_SIZE);
-    dim3 grd_test((HIDDEN_DIM+TILE_SIZE-1)/TILE_SIZE, (test_n+TILE_SIZE-1)/TILE_SIZE);
-    matmul<<<grd_test,blk>>>(d_test_input, d_w1, d_test_hidden, test_n, HIDDEN_DIM, INPUT_DIM);
-    relu_forward<<<(test_n*HIDDEN_DIM+255)/256,256>>>(d_test_hidden, test_n*HIDDEN_DIM);
+    // 从训练集的最后INPUT_DIM个点开始
+    std::vector<double> current_window(raw.begin() + train_n, raw.begin() + train_n + INPUT_DIM);
     
-    grd_test.x = (OUTPUT_DIM+TILE_SIZE-1)/TILE_SIZE;
-    grd_test.y = (test_n+TILE_SIZE-1)/TILE_SIZE;
-    matmul<<<grd_test,blk>>>(d_test_hidden, d_w2, d_test_output, test_n, OUTPUT_DIM, HIDDEN_DIM);
+    for (size_t i = 0; i < test_n; ++i) {
+        // 准备当前窗口的输入（已归一化）
+        hipMemcpy(d_single_input, current_window.data(), INPUT_DIM*sizeof(double), hipMemcpyHostToDevice);
+        
+        // 前向传播
+        dim3 blk_single(TILE_SIZE, TILE_SIZE);
+        dim3 grd_single((HIDDEN_DIM+TILE_SIZE-1)/TILE_SIZE, (1+TILE_SIZE-1)/TILE_SIZE);
+        matmul<<<grd_single,blk_single>>>(d_single_input, d_w1, d_single_hidden, 1, HIDDEN_DIM, INPUT_DIM);
+        add_bias<<<(HIDDEN_DIM+255)/256,256>>>(d_single_hidden, d_b1, 1, HIDDEN_DIM);
+        relu_forward<<<(HIDDEN_DIM+255)/256,256>>>(d_single_hidden, HIDDEN_DIM);
+        
+        grd_single.x = (OUTPUT_DIM+TILE_SIZE-1)/TILE_SIZE;
+        matmul<<<grd_single,blk_single>>>(d_single_hidden, d_w2, d_single_output, 1, OUTPUT_DIM, HIDDEN_DIM);
+        add_bias<<<(OUTPUT_DIM+255)/256,256>>>(d_single_output, d_b2, 1, OUTPUT_DIM);
+        
+        // 获取预测结果
+        double prediction_normalized;
+        hipMemcpy(&prediction_normalized, d_single_output, sizeof(double), hipMemcpyDeviceToHost);
+        
+        // 保存结果
+        sliding_predictions.push_back(prediction_normalized);
+        sliding_true_values.push_back(hY_test[i]);  // 已归一化的真实值
+        sliding_positions.push_back(train_n + INPUT_DIM + i);
+        
+        // 更新滑动窗口：移除第一个元素，添加真实值（用于下一次预测）
+        if (i < test_n - 1) {
+            current_window.erase(current_window.begin());
+            current_window.push_back(raw[train_n + INPUT_DIM + i]);  // 添加真实的归一化值
+        }
+    }
     
-    // 同步等待所有kernel完成
     hipDeviceSynchronize();
-    
     auto end_time = std::chrono::high_resolution_clock::now();
     auto inference_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
     
-    // 拷回预测结果
-    std::vector<double> hY_pred(test_n * OUTPUT_DIM);
-    hipMemcpy(hY_pred.data(), d_test_output, test_n*OUTPUT_DIM*sizeof(double), hipMemcpyDeviceToHost);
-    
     // 反归一化预测结果和真实值
-    std::vector<double> denorm_pred = hY_pred;
-    std::vector<double> denorm_test = hY_test;
+    std::vector<double> denorm_pred = sliding_predictions;
+    std::vector<double> denorm_test = sliding_true_values;
     denormalize_data(denorm_pred, min_v, max_v);
     denormalize_data(denorm_test, min_v, max_v);
     
-    // 计算测试集MSE
+    // 计算性能指标
     double test_mse = 0.0;
     for (size_t i = 0; i < test_n; ++i) {
         double diff = denorm_pred[i] - denorm_test[i];
@@ -375,29 +463,51 @@ int main() {
     }
     test_mse /= test_n;
     
-    std::cout << "推理完成！" << std::endl;
-    std::cout << "推理时间: " << inference_time.count() << " 微秒" << std::endl;
+    std::cout << "滑动窗口预测完成！" << std::endl;
+    std::cout << "预测时间: " << inference_time.count() << " 微秒" << std::endl;
     std::cout << "测试集MSE: " << test_mse << std::endl;
+    
+    // 检查预测值范围
+    double norm_pred_min = *std::min_element(sliding_predictions.begin(), sliding_predictions.end());
+    double norm_pred_max = *std::max_element(sliding_predictions.begin(), sliding_predictions.end());
+    std::cout << "归一化预测值范围: [" << norm_pred_min << ", " << norm_pred_max << "]" << std::endl;
+    std::cout << "反归一化后预测值范围: [" << *std::min_element(denorm_pred.begin(), denorm_pred.end()) 
+              << ", " << *std::max_element(denorm_pred.begin(), denorm_pred.end()) << "]" << std::endl;
     
     // 保存结果到CSV文件
     std::ofstream csv_file("inference_results.csv");
-    csv_file << "Position,True_Value,Predicted_Value,Error,Abs_Error\n";
+    csv_file << "Position,True_Value,Predicted_Value,Error,Abs_Error,Normalized_True,Normalized_Pred\n";
     
     for (size_t i = 0; i < test_n; ++i) {
         double error = denorm_pred[i] - denorm_test[i];
-        csv_file << (train_n + i) << "," 
+        csv_file << sliding_positions[i] << "," 
                 << denorm_test[i] << ","
                 << denorm_pred[i] << ","
                 << error << ","
-                << std::abs(error) << "\n";
+                << std::abs(error) << ","
+                << sliding_true_values[i] << ","
+                << sliding_predictions[i] << "\n";
     }
     csv_file.close();
-    std::cout << "推理结果已保存到 inference_results.csv" << std::endl;
+    std::cout << "滑动窗口预测结果已保存到 inference_results.csv" << std::endl;
     
-    // 清理测试内存
-    hipFree(d_test_input);
-    hipFree(d_test_hidden);
-    hipFree(d_test_output);
+    // 输出前几个样本进行调试
+    std::cout << "\n前5个测试样本详情:" << std::endl;
+    std::cout << "位置\t真实值\t\t预测值\t\t误差\t\t归一化真实值\t归一化预测值" << std::endl;
+    for (size_t i = 0; i < std::min(5UL, test_n); ++i) {
+        double error = denorm_pred[i] - denorm_test[i];
+        std::cout << sliding_positions[i] << "\t" 
+                  << std::fixed << std::setprecision(6) << denorm_test[i] << "\t"
+                  << denorm_pred[i] << "\t"
+                  << error << "\t"
+                  << sliding_true_values[i] << "\t\t"
+                  << sliding_predictions[i] << std::endl;
+    }
+
+    // 清理内存
+    hipFree(d_single_input);
+    hipFree(d_single_hidden);
+    hipFree(d_single_output);
 
     // 7. 清理
     hipFree(d_input); hipFree(d_target);
