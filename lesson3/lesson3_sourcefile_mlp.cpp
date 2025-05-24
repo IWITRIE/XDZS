@@ -210,96 +210,6 @@ void denormalize_data(std::vector<double>& data, double min_val, double max_val)
     return;
 }
 
-// 新增：MLP 网络封装
-struct MLPNetwork {
-    int in_dim, hid_dim, out_dim;
-    double lr;
-    // Device 指针
-    double *d_input, *d_hidden, *d_output, *d_target;
-    double *d_w1, *d_b1, *d_w2, *d_b2;
-    double *d_w1g, *d_b1g, *d_w2g, *d_b2g;
-    double *d_og, *d_hg;  // output_grad, hidden_grad
-
-    MLPNetwork(int in, int hid, int out, double lr):
-        in_dim(in), hid_dim(hid), out_dim(out), lr(lr) {}
-
-    void init(size_t batch) {
-        // 分配参数与中间量
-        hipMalloc(&d_input,  batch*in_dim*sizeof(double));
-        hipMalloc(&d_hidden, batch*hid_dim*sizeof(double));
-        hipMalloc(&d_output, batch*out_dim*sizeof(double));
-        hipMalloc(&d_target, batch*out_dim*sizeof(double));
-        hipMalloc(&d_w1, in_dim*hid_dim*sizeof(double));
-        hipMalloc(&d_b1, hid_dim*sizeof(double));
-        hipMalloc(&d_w2, hid_dim*out_dim*sizeof(double));
-        hipMalloc(&d_b2, out_dim*sizeof(double));
-        hipMalloc(&d_w1g, in_dim*hid_dim*sizeof(double));
-        hipMalloc(&d_b1g, hid_dim*sizeof(double));
-        hipMalloc(&d_w2g, hid_dim*out_dim*sizeof(double));
-        hipMalloc(&d_b2g, out_dim*sizeof(double));
-        hipMalloc(&d_hg,  batch*hid_dim*sizeof(double));
-        hipMalloc(&d_og,  batch*out_dim*sizeof(double));
-        // 随机初始化主机参数并拷贝，可自行替换为自定义 init
-        std::vector<double> h1(in_dim*hid_dim), hb1(hid_dim),
-                            h2(hid_dim*out_dim), hb2(out_dim);
-        for(auto& v:h1) v=0.01*(rand()/(double)RAND_MAX);
-        for(auto& v:hb1) v=0;
-        for(auto& v:h2) v=0.01*(rand()/(double)RAND_MAX);
-        for(auto& v:hb2) v=0;
-        hipMemcpy(d_w1,h1.data(),h1.size()*sizeof(double),hipMemcpyHostToDevice);
-        hipMemcpy(d_b1,hb1.data(),hb1.size()*sizeof(double),hipMemcpyHostToDevice);
-        hipMemcpy(d_w2,h2.data(),h2.size()*sizeof(double),hipMemcpyHostToDevice);
-        hipMemcpy(d_b2,hb2.data(),hb2.size()*sizeof(double),hipMemcpyHostToDevice);
-    }
-
-    void forward(size_t batch) {
-        dim3 blk(TILE_SIZE,TILE_SIZE),
-             grd1((hid_dim+TILE_SIZE-1)/TILE_SIZE,(batch+TILE_SIZE-1)/TILE_SIZE);
-        matmul<<<grd1,blk>>>(d_input,d_w1,d_hidden,batch,hid_dim,in_dim);
-        relu_forward<<<(batch*hid_dim+255)/256,256>>>(d_hidden,batch*hid_dim);
-        dim3 grd2((out_dim+TILE_SIZE-1)/TILE_SIZE,(batch+TILE_SIZE-1)/TILE_SIZE);
-        matmul<<<grd2,blk>>>(d_hidden,d_w2,d_output,batch,out_dim,hid_dim);
-    }
-
-    void backward(size_t batch) {
-        // output_grad
-        compute_output_grad<<<(batch*out_dim+255)/256,256>>>(d_output,d_target,d_og,batch*out_dim);
-        // hidden_grad
-        compute_relu_backward<<<(batch*hid_dim+255)/256,256>>>(d_hg,d_hidden,batch*hid_dim);
-        // weights/bias 梯度
-        dim3 b2(16,16), g2((hid_dim+15)/16,(out_dim+15)/16);
-        compute_w2_grad<<<g2,b2>>>(d_hidden,d_og,d_w2g,batch,hid_dim,out_dim);
-        compute_bias_grad<<<(out_dim+255)/256,256>>>(d_og,d_b2g,batch,out_dim);
-        dim3 b1(16,16), g1((in_dim+15)/16,(hid_dim+15)/16);
-        compute_w1_grad<<<g1,b1>>>(d_input,d_hg,d_w1g,batch,in_dim,hid_dim);
-        compute_bias_grad<<<(hid_dim+255)/256,256>>>(d_hg,d_b1g,batch,hid_dim);
-    }
-
-    void update() {
-        int sz1=in_dim*hid_dim, sz2=hid_dim*out_dim;
-        sgd_update<<<(sz1+255)/256,256>>>(d_w1,d_w1g,lr,sz1);
-        sgd_update<<<(hid_dim+255)/256,256>>>(d_b1,d_b1g,lr,hid_dim);
-        sgd_update<<<(sz2+255)/256,256>>>(d_w2,d_w2g,lr,sz2);
-        sgd_update<<<(out_dim+255)/256,256>>>(d_b2,d_b2g,lr,out_dim);
-    }
-
-    double compute_loss(size_t batch, std::vector<double>& loss_host) {
-        double *d_loss; hipMalloc(&d_loss,batch*out_dim*sizeof(double));
-        compute_mse_loss<<<(batch*out_dim+255)/256,256>>>(d_output,d_target,d_loss,batch*out_dim);
-        hipMemcpy(loss_host.data(),d_loss,batch*out_dim*sizeof(double),hipMemcpyDeviceToHost);
-        hipFree(d_loss);
-        double sum=0; for(double v:loss_host) sum+=v;
-        return sum/(batch*out_dim);
-    }
-
-    void destroy() {
-        hipFree(d_input); hipFree(d_hidden); hipFree(d_output); hipFree(d_target);
-        hipFree(d_w1); hipFree(d_b1); hipFree(d_w2); hipFree(d_b2);
-        hipFree(d_w1g);hipFree(d_b1g);hipFree(d_w2g);hipFree(d_b2g);
-        hipFree(d_hg); hipFree(d_og);
-    }
-};
-
 // ----------------------------- Main -------------------------------
 int main() {
     // 1. 数据准备
@@ -415,11 +325,79 @@ int main() {
     }
 
     hipFree(d_loss);
-    // 6. 推理 & 性能评测（同训练前向部分，但输入为 hX_test）
-    //    - 复用 d_input, d_hidden, d_output
-    //    - 计时 front Prop
-    //    - 拷回结果到 hY_pred
-    //    - de-normalize 后计算 test MSE
+    
+    // 6. 推理 & 性能评测
+    std::cout << "开始推理..." << std::endl;
+    
+    // 重新分配输入内存用于测试数据
+    double *d_test_input, *d_test_hidden, *d_test_output;
+    hipMalloc(&d_test_input, test_n*INPUT_DIM*sizeof(double));
+    hipMalloc(&d_test_hidden, test_n*HIDDEN_DIM*sizeof(double));
+    hipMalloc(&d_test_output, test_n*OUTPUT_DIM*sizeof(double));
+    
+    // 拷贝测试数据
+    hipMemcpy(d_test_input, hX_test.data(), test_n*INPUT_DIM*sizeof(double), hipMemcpyHostToDevice);
+    
+    // 开始计时
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
+    // 推理前向传播
+    dim3 blk(TILE_SIZE, TILE_SIZE);
+    dim3 grd_test((HIDDEN_DIM+TILE_SIZE-1)/TILE_SIZE, (test_n+TILE_SIZE-1)/TILE_SIZE);
+    matmul<<<grd_test,blk>>>(d_test_input, d_w1, d_test_hidden, test_n, HIDDEN_DIM, INPUT_DIM);
+    relu_forward<<<(test_n*HIDDEN_DIM+255)/256,256>>>(d_test_hidden, test_n*HIDDEN_DIM);
+    
+    grd_test.x = (OUTPUT_DIM+TILE_SIZE-1)/TILE_SIZE;
+    grd_test.y = (test_n+TILE_SIZE-1)/TILE_SIZE;
+    matmul<<<grd_test,blk>>>(d_test_hidden, d_w2, d_test_output, test_n, OUTPUT_DIM, HIDDEN_DIM);
+    
+    // 同步等待所有kernel完成
+    hipDeviceSynchronize();
+    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto inference_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+    
+    // 拷回预测结果
+    std::vector<double> hY_pred(test_n * OUTPUT_DIM);
+    hipMemcpy(hY_pred.data(), d_test_output, test_n*OUTPUT_DIM*sizeof(double), hipMemcpyDeviceToHost);
+    
+    // 反归一化预测结果和真实值
+    std::vector<double> denorm_pred = hY_pred;
+    std::vector<double> denorm_test = hY_test;
+    denormalize_data(denorm_pred, min_v, max_v);
+    denormalize_data(denorm_test, min_v, max_v);
+    
+    // 计算测试集MSE
+    double test_mse = 0.0;
+    for (size_t i = 0; i < test_n; ++i) {
+        double diff = denorm_pred[i] - denorm_test[i];
+        test_mse += diff * diff;
+    }
+    test_mse /= test_n;
+    
+    std::cout << "推理完成！" << std::endl;
+    std::cout << "推理时间: " << inference_time.count() << " 微秒" << std::endl;
+    std::cout << "测试集MSE: " << test_mse << std::endl;
+    
+    // 保存结果到CSV文件
+    std::ofstream csv_file("inference_results.csv");
+    csv_file << "Position,True_Value,Predicted_Value,Error,Abs_Error\n";
+    
+    for (size_t i = 0; i < test_n; ++i) {
+        double error = denorm_pred[i] - denorm_test[i];
+        csv_file << (train_n + i) << "," 
+                << denorm_test[i] << ","
+                << denorm_pred[i] << ","
+                << error << ","
+                << std::abs(error) << "\n";
+    }
+    csv_file.close();
+    std::cout << "推理结果已保存到 inference_results.csv" << std::endl;
+    
+    // 清理测试内存
+    hipFree(d_test_input);
+    hipFree(d_test_hidden);
+    hipFree(d_test_output);
 
     // 7. 清理
     hipFree(d_input); hipFree(d_target);
